@@ -1,4 +1,5 @@
 # save-3-clicks
+https://greasyfork.org/en/scripts/569121-save3clicks-m365-copilot
 
 **Tampermonkey script for Microsoft 365 Copilot Enterprise/Education**  
 Stops the “auto” default and lets you pick your preferred GPT model in one click.

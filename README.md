@@ -9,7 +9,7 @@ Stops the “auto” default and lets you pick your preferred GPT model in one c
 
 Tired of:
 
-- Clicking **Auto**, then **More**, then selecting one of three GPT versions?
+- Clicking **Auto**, then **More**, then selecting one of four GPT versions? (2026/03/10)
 - Being forced to use the default model every time you start a new chat?
 - Not being on Windows (no desktop app) and stuck with the web UI?
 
@@ -30,10 +30,20 @@ This script fixes that by automatically selecting the model you want when Copilo
 
 ## Customization
 
-- The default target model is **GPT‑5.4**, chosen for its high benchmark scores and robust prompt handling.
+- The default target model is **GPT‑5.4 Think Deeper**, chosen for its high benchmark scores and robust prompt handling.
 - To change the target model, edit the script and adjust the `targetMode` or run the “Set target mode” action from the menu.
 - If you don’t want the script to open the **More** menu (i.e. you just want “Ambiguous / Quick response / Think deeper”), turn off the `clickMore` option—then it won’t expand the menu at all.
 
 ---
 
-Enjoy a smoother Copilot experience with one less click!
+Enjoy a smoother Copilot experience with 3 less clicks!
+
+---
+
+## Disclaimer
+
+I do **not** own any of the software this script interacts with and am not responsible for how it behaves.  
+The version provided here is safe to the best of my knowledge, but future adjustments may not have the same effect or could introduce issues.  
+It currently works on Firefox running on Debian Linux; feel free to pull the repo, test on your own setup, and contribute any compatibility notes or improvements.
+
+

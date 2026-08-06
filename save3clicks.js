@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Save3Clicks
+// @name         Save3Clicks for M365 Copilot
 // @namespace    anon.local.Save3Clicks
-// @version      1.1.0
-// @description  On matching URLs, open the mode switcher, optionally click More, and select a configured mode.
-// @match        *://*/*
+// @version      1.2.0
+// @description  Automatically selects a preferred model in Microsoft 365 Copilot.
+// @match        https://m365.cloud.microsoft/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -13,329 +13,1521 @@
 (function () {
   'use strict';
 
-  // CHANGE DEFAULT MODE HERE IF THERE ARE UPDATES TO M365 COPILOT
-  const DEFAULT_MODE = 'GPT-5.4 Think deeper';
-  // SOME M365 HAVE UNIQUE URLS BASED ON ORGANIZATION
-  // THESE ARE MY DEFAULTS SO JUST ADD MORE
-  const DEFAULT_URL_RULES = [
-    'https://m365.cloud.microsoft/chat?fromCode=CsrToSSR',
-    'https://m365.cloud.microsoft/chat'
+  /*
+   * ================================================================
+   * DEFAULT CONFIGURATION
+   * ================================================================
+   */
+
+  /*
+   * Each array item represents one menu click.
+   *
+   * Current Copilot menu arrangement:
+   *
+   * 1. Open the model selector.
+   * 2. Click "GPT".
+   * 3. Click "GPT 5.6 Think deeper" in the submenu.
+   */
+  const DEFAULT_MODEL_PATH = [
+    'GPT',
+    'GPT 5.6 Think deeper'
   ];
 
-  const KEY_MODE = 'targetMode';
-  const KEY_URL_RULES = 'urlRules';
-  const KEY_ALWAYS_CLICK_MORE = 'alwaysClickMore';
+  /*
+   * Automatic selection runs only on Copilot Chat URLs.
+   */
+  const CHAT_URL_PREFIX =
+    'https://m365.cloud.microsoft/chat';
 
-  let lastProcessedUrl = null;
-  let runInProgress = false;
+  /*
+   * Persistent Violentmonkey storage keys.
+   */
+  const KEY_MODEL_PATH = 'modelPath';
+  const KEY_ENABLED = 'automaticSelectionEnabled';
 
-  function getMode() {
-    return GM_getValue(KEY_MODE, DEFAULT_MODE);
-  }
+  /*
+   * Delay after an internal Copilot navigation.
+   */
+  const NAVIGATION_DELAY_MS = 600;
 
-  function setMode(value) {
-    GM_setValue(KEY_MODE, String(value || '').trim() || DEFAULT_MODE);
-  }
+  /*
+   * Maximum time to wait for a Copilot interface element.
+   */
+  const ELEMENT_TIMEOUT_MS = 10000;
 
-  function getUrlRules() {
-    const saved = GM_getValue(KEY_URL_RULES, DEFAULT_URL_RULES);
-    return Array.isArray(saved) ? saved : DEFAULT_URL_RULES;
-  }
+  /*
+   * Internal state.
+   */
+  let selectionInProgress = false;
+  let pendingSelectionTimer = null;
+  let lastSuccessfulUrl = null;
+  let switcherObserver = null;
+  let observedSwitcherRoot = null;
 
-  function setUrlRules(lines) {
-    const rules = String(lines || '')
-      .split('\n')
-      .map(s => s.trim())
+  /*
+   * ================================================================
+   * CONFIGURATION
+   * ================================================================
+   */
+
+  /**
+   * Returns the stored model-menu path.
+   *
+   * @returns {string[]}
+   */
+  function getModelPath() {
+    const savedPath = GM_getValue(
+      KEY_MODEL_PATH,
+      DEFAULT_MODEL_PATH
+    );
+
+    if (!Array.isArray(savedPath)) {
+      return [...DEFAULT_MODEL_PATH];
+    }
+
+    const cleanedPath = savedPath
+      .map(value => String(value || '').trim())
       .filter(Boolean);
-    GM_setValue(KEY_URL_RULES, rules);
+
+    return cleanedPath.length > 0
+      ? cleanedPath
+      : [...DEFAULT_MODEL_PATH];
   }
 
-  function getAlwaysClickMore() {
-    return GM_getValue(KEY_ALWAYS_CLICK_MORE, true);
+  /**
+   * Stores a model-menu path.
+   *
+   * @param {string[]} path
+   */
+  function setModelPath(path) {
+    const cleanedPath = Array.isArray(path)
+      ? path
+          .map(value => String(value || '').trim())
+          .filter(Boolean)
+      : [];
+
+    GM_setValue(
+      KEY_MODEL_PATH,
+      cleanedPath.length > 0
+        ? cleanedPath
+        : [...DEFAULT_MODEL_PATH]
+    );
   }
 
-  function setAlwaysClickMore(value) {
-    GM_setValue(KEY_ALWAYS_CLICK_MORE, !!value);
+  /**
+   * Returns the final model label from the configured path.
+   *
+   * @returns {string}
+   */
+  function getFinalModelLabel() {
+    const path = getModelPath();
+
+    return (
+      path[path.length - 1] ||
+      DEFAULT_MODEL_PATH[
+        DEFAULT_MODEL_PATH.length - 1
+      ]
+    );
   }
 
-  function normalizeText(s) {
-    return String(s || '')
+  /**
+   * Returns whether automatic selection is enabled.
+   *
+   * @returns {boolean}
+   */
+  function isAutomaticSelectionEnabled() {
+    return GM_getValue(KEY_ENABLED, true);
+  }
+
+  /**
+   * Enables or disables automatic selection.
+   *
+   * @param {boolean} enabled
+   */
+  function setAutomaticSelectionEnabled(enabled) {
+    GM_setValue(KEY_ENABLED, Boolean(enabled));
+  }
+
+  /*
+   * ================================================================
+   * GENERAL UTILITIES
+   * ================================================================
+   */
+
+  /**
+   * Converts displayed text into a consistent comparison form.
+   *
+   * @param {*} value
+   * @returns {string}
+   */
+  function normalizeText(value) {
+    return String(value || '')
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
   }
 
-  function ruleMatchesUrl(rule, url) {
-    if (!rule) return false;
-
-    if (rule.startsWith('/') && rule.endsWith('/')) {
-      try {
-        const rx = new RegExp(rule.slice(1, -1));
-        return rx.test(url);
-      } catch {
-        return false;
-      }
-    }
-
-    return url.includes(rule);
-  }
-
-  function currentUrlMatches() {
-    const rules = getUrlRules();
-    if (!rules.length) return false;
-    const url = location.href;
-    return rules.some(rule => ruleMatchesUrl(rule, url));
-  }
-
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  function isVisible(el) {
-    if (!el) return false;
-    const style = getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    return (
-      style.display !== 'none' &&
-      style.visibility !== 'hidden' &&
-      style.opacity !== '0' &&
-      rect.width > 0 &&
-      rect.height > 0
-    );
-  }
-
-  async function waitForFinder(findFn, { timeout = 8000, interval = 100 } = {}) {
-    const immediate = findFn();
-    if (immediate) return immediate;
-
-    return new Promise((resolve, reject) => {
-      const started = Date.now();
-
-      const timer = setInterval(() => {
-        const found = findFn();
-        if (found) {
-          cleanup();
-          resolve(found);
-          return;
-        }
-        if (Date.now() - started > timeout) {
-          cleanup();
-          reject(new Error('Timeout waiting for element'));
-        }
-      }, interval);
-
-      const observer = new MutationObserver(() => {
-        const found = findFn();
-        if (found) {
-          cleanup();
-          resolve(found);
-        }
-      });
-
-      function cleanup() {
-        clearInterval(timer);
-        observer.disconnect();
-      }
-
-      observer.observe(document.documentElement || document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-      });
+  /**
+   * Waits for the specified duration.
+   *
+   * @param {number} milliseconds
+   * @returns {Promise<void>}
+   */
+  function sleep(milliseconds) {
+    return new Promise(resolve => {
+      setTimeout(resolve, milliseconds);
     });
   }
 
-  // clicker
-  function safeClick(el) {
-    if (!el) return false;
+  /**
+   * Returns whether the current URL is a Copilot Chat URL.
+   *
+   * @returns {boolean}
+   */
+  function isCopilotChatPage() {
+    return location.href.startsWith(
+      CHAT_URL_PREFIX
+    );
+  }
+
+  /**
+   * Returns whether an element is visibly rendered.
+   *
+   * @param {Element|null} element
+   * @returns {boolean}
+   */
+  function isVisible(element) {
+    if (!element || !element.isConnected) {
+      return false;
+    }
+
+    const rectangle =
+      element.getBoundingClientRect();
+
+    if (
+      rectangle.width <= 0 ||
+      rectangle.height <= 0
+    ) {
+      return false;
+    }
+
+    const style = getComputedStyle(element);
+
+    return (
+      style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      Number(style.opacity) !== 0
+    );
+  }
+
+  /**
+   * Waits until a finder function returns a value.
+   *
+   * The MutationObserver exists only while waiting and is disconnected
+   * immediately after success or timeout.
+   *
+   * @param {Function} finder
+   * @param {number} timeout
+   * @returns {Promise<*>}
+   */
+  function waitForElement(
+    finder,
+    timeout = ELEMENT_TIMEOUT_MS
+  ) {
+    const immediateResult = finder();
+
+    if (immediateResult) {
+      return Promise.resolve(immediateResult);
+    }
+
+    return new Promise((resolve, reject) => {
+      let completed = false;
+
+      /**
+       * Stops the temporary observer and timeout.
+       */
+      function cleanup() {
+        if (completed) {
+          return;
+        }
+
+        completed = true;
+        clearTimeout(timeoutTimer);
+        observer.disconnect();
+      }
+
+      /**
+       * Checks whether the requested element is available.
+       */
+      function check() {
+        if (completed) {
+          return;
+        }
+
+        const result = finder();
+
+        if (result) {
+          cleanup();
+          resolve(result);
+        }
+      }
+
+      const observer =
+        new MutationObserver(check);
+
+      observer.observe(
+        document.documentElement,
+        {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: [
+            'aria-expanded',
+            'aria-hidden',
+            'aria-label',
+            'title',
+            'style',
+            'class'
+          ]
+        }
+      );
+
+      const timeoutTimer = setTimeout(() => {
+        cleanup();
+
+        reject(
+          new Error(
+            'Timeout waiting for a Copilot interface element'
+          )
+        );
+      }, timeout);
+    });
+  }
+
+  /**
+   * Performs a Firefox-compatible click.
+   *
+   * MouseEventInit.view is deliberately omitted because Firefox can
+   * reject Violentmonkey's sandboxed window proxy.
+   *
+   * @param {Element|null} element
+   * @returns {boolean}
+   */
+  function safeClick(element) {
+    if (!element) {
+      return false;
+    }
+
     try {
-      el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-      el.click();
+      element.scrollIntoView({
+        block: 'nearest',
+        inline: 'nearest'
+      });
+
+      /*
+       * Focus improves submenu activation in Fluent UI.
+       */
+      if (
+        typeof element.focus === 'function'
+      ) {
+        element.focus();
+      }
+
+      const commonOptions = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        button: 0
+      };
+
+      element.dispatchEvent(
+        new MouseEvent(
+          'mouseover',
+          commonOptions
+        )
+      );
+
+      element.dispatchEvent(
+        new MouseEvent(
+          'mousemove',
+          commonOptions
+        )
+      );
+
+      element.dispatchEvent(
+        new MouseEvent(
+          'mousedown',
+          commonOptions
+        )
+      );
+
+      element.dispatchEvent(
+        new MouseEvent(
+          'mouseup',
+          commonOptions
+        )
+      );
+
+      element.click();
+
       return true;
-    } catch (err) {
-      console.warn('[AutoMode] Click failed:', err);
+    } catch (error) {
+      console.warn(
+        '[Save3Clicks] Click failed:',
+        error
+      );
+
       return false;
     }
   }
 
-  // hard coded id name for the element, ill update this if it changes in the future
+  /*
+   * ================================================================
+   * COPILOT INTERFACE DETECTION
+   * ================================================================
+   */
+
+  /**
+   * Finds the Copilot model-switcher button.
+   *
+   * The current element ID is preferred. Accessible attributes and
+   * visible text provide fallbacks if Microsoft changes that ID.
+   *
+   * @returns {Element|null}
+   */
   function getSwitcherButton() {
-    return document.getElementById('gptModeSwitcher');
+    const currentSwitcher =
+      document.getElementById(
+        'gptModeSwitcher'
+      );
+
+    if (isVisible(currentSwitcher)) {
+      return currentSwitcher;
+    }
+
+    const candidates = [
+      ...document.querySelectorAll(
+        [
+          'button[aria-haspopup="menu"]',
+          'button[aria-haspopup="listbox"]',
+          '[role="button"][aria-haspopup="menu"]',
+          '[role="button"][aria-haspopup="listbox"]'
+        ].join(', ')
+      )
+    ].filter(isVisible);
+
+    return candidates.find(candidate => {
+      const searchableText = normalizeText(
+        [
+          candidate.textContent,
+          candidate.getAttribute(
+            'aria-label'
+          ),
+          candidate.getAttribute('title')
+        ]
+          .filter(Boolean)
+          .join(' ')
+      );
+
+      return (
+        searchableText.includes('gpt') ||
+        searchableText.includes(
+          'automatic'
+        ) ||
+        searchableText.includes(
+          'automaticky'
+        ) ||
+        searchableText.includes(
+          'think deeper'
+        ) ||
+        searchableText.includes(
+          'přemýšlení'
+        )
+      );
+    }) || null;
   }
 
-  function getOpenMenus() {
-    return [...document.querySelectorAll('div[role="menu"]')];
-  }
+  /**
+   * Returns the normalized visible switcher text.
+   *
+   * @returns {string}
+   */
+  function getSwitcherText() {
+    const switcher = getSwitcherButton();
 
-  function getMenuItems() {
-    const menus = getOpenMenus();
-    const items = menus.flatMap(menu => [...menu.querySelectorAll('[role="menuitem"], [role="button"]')]);
-    return items.filter(isVisible);
-  }
+    if (!switcher) {
+      return '';
+    }
 
-  function findItemByLabel(label) {
-    const target = normalizeText(label);
-    return getMenuItems().find(el => normalizeText(el.textContent).includes(target)) || null;
-  }
-
-  function isItemSelected(item) {
-    if (!item) return false;
-
-    const visibleCheckmark = item.querySelector(
-      'span[style*="visibility: visible"] svg[data-testid^="checkmark"]'
+    return normalizeText(
+      [
+        switcher.textContent,
+        switcher.getAttribute(
+          'aria-label'
+        ),
+        switcher.getAttribute('title')
+      ]
+        .filter(Boolean)
+        .join(' ')
     );
-    if (visibleCheckmark) return true;
-
-    const anyVisibleCheck = [...item.querySelectorAll('svg[data-testid^="checkmark"]')]
-      .some(svg => {
-        const parent = svg.closest('span') || svg;
-        return isVisible(parent);
-      });
-
-    return anyVisibleCheck;
   }
 
-  async function openSwitcherMenu() {
-    // if the menu = open then do nothing, otherwise open
-    if (getMenuItems().length) return true;
+  /**
+   * Returns whether the closed switcher represents the configured
+   * final model.
+   *
+   * Copilot may abbreviate:
+   *
+   *   GPT 5.6 Think deeper
+   *
+   * as:
+   *
+   *   GPT 5.6 Think
+   *
+   * The model version and mode are therefore compared independently.
+   *
+   * @returns {boolean}
+   */
+  function isConfiguredModelAlreadyActive() {
+    const switcherText =
+      getSwitcherText();
 
-    const btn = await waitForFinder(() => getSwitcherButton(), { timeout: 12000 });
-    if (!btn) throw new Error('gptModeSwitcher not found');
+    const targetText = normalizeText(
+      getFinalModelLabel()
+    );
 
-    safeClick(btn);
+    if (!switcherText || !targetText) {
+      return false;
+    }
 
-    await waitForFinder(() => getMenuItems().length > 0 ? getMenuItems()[0] : null, {
-      timeout: 6000
-    });
+    /*
+     * A complete target label in the switcher is an unambiguous match.
+     */
+    if (
+      switcherText.includes(targetText)
+    ) {
+      return true;
+    }
+
+    /*
+     * Extract the GPT version from the target and switcher.
+     *
+     * Accepted forms include:
+     *
+     *   GPT 5.6
+     *   GPT-5.6
+     *   GPT5.6
+     */
+    const versionExpression =
+      /\bgpt\s*-?\s*(\d+(?:\.\d+)*)\b/;
+
+    const targetVersion =
+      targetText.match(
+        versionExpression
+      )?.[1];
+
+    const switcherVersion =
+      switcherText.match(
+        versionExpression
+      )?.[1];
+
+    if (
+      !targetVersion ||
+      !switcherVersion ||
+      targetVersion !== switcherVersion
+    ) {
+      return false;
+    }
+
+    /*
+     * Distinguish a reasoning model from a quick-response model using
+     * the same GPT version.
+     */
+    const targetIsThinkMode =
+      targetText.includes('think') ||
+      targetText.includes('deeper');
+
+    const switcherIsThinkMode =
+      switcherText.includes('think') ||
+      switcherText.includes('deeper');
+
+    if (
+      targetIsThinkMode !==
+      switcherIsThinkMode
+    ) {
+      return false;
+    }
 
     return true;
   }
 
-  async function clickMoreIfPresent() {
-    if (!getAlwaysClickMore()) return 'skipped-disabled';
+  /**
+   * Returns whether the switcher displays Automatic mode.
+   *
+   * @returns {boolean}
+   */
+  function isAutomaticModeShown() {
+    const switcherText =
+      getSwitcherText();
 
-    // find the more button by label
-    let moreItem = findItemByLabel('More');
-
-    // retry in case your webpage is slow to load
-    if (!moreItem) {
-      await sleep(250);
-      moreItem = findItemByLabel('More');
-    }
-
-    if (!moreItem) {
-      return 'not-found';
-    }
-
-    // if it looks like a submenu then click it
-    safeClick(moreItem);
-
-    // even more time for slow ui
-    await sleep(250);
-    return 'clicked';
+    return (
+      switcherText === 'auto' ||
+      switcherText.includes(
+        'automatic'
+      ) ||
+      switcherText.includes(
+        'automaticky'
+      )
+    );
   }
 
-  async function selectMode(modeLabel) {
-    await openSwitcherMenu();
-    await clickMoreIfPresent();
+  /**
+   * Returns all visible Copilot menus and listboxes.
+   *
+   * @returns {Element[]}
+   */
+  function getOpenMenus() {
+    return [
+      ...document.querySelectorAll(
+        '[role="menu"], [role="listbox"]'
+      )
+    ].filter(isVisible);
+  }
 
-    let item = findItemByLabel(modeLabel);
+  /**
+   * Returns visible interactive entries inside one menu.
+   *
+   * @param {Element|null} menu
+   * @returns {Element[]}
+   */
+  function getMenuItems(menu) {
+    if (!menu) {
+      return [];
+    }
 
-    // even more time for slow ur but for finindng the item this time
+    return [
+      ...menu.querySelectorAll(
+        [
+          '[role="menuitem"]',
+          '[role="menuitemradio"]',
+          '[role="menuitemcheckbox"]',
+          '[role="option"]',
+          '[role="button"]',
+          'button'
+        ].join(', ')
+      )
+    ].filter(isVisible);
+  }
+
+  /**
+   * Returns the normalized comparison text for a menu entry.
+   *
+   * @param {Element} item
+   * @returns {string}
+   */
+  function getMenuItemText(item) {
+    return normalizeText(
+      [
+        item.textContent,
+        item.getAttribute(
+          'aria-label'
+        ),
+        item.getAttribute('title')
+      ]
+        .filter(Boolean)
+        .join(' ')
+    );
+  }
+
+  /**
+   * Finds a menu item by its visible label.
+   *
+   * Exact matching is preferred so that "GPT" does not accidentally
+   * match "GPT 5.6 Think deeper".
+   *
+   * @param {Element|null} menu
+   * @param {string} label
+   * @returns {Element|null}
+   */
+  function findMenuItem(menu, label) {
+    const target =
+      normalizeText(label);
+
+    const items =
+      getMenuItems(menu);
+
+    const exactMatch =
+      items.find(item => {
+        return (
+          getMenuItemText(item) === target
+        );
+      });
+
+    if (exactMatch) {
+      return exactMatch;
+    }
+
+    return items.find(item => {
+      return getMenuItemText(
+        item
+      ).includes(target);
+    }) || null;
+  }
+
+  /**
+   * Returns whether a menu item is marked as selected.
+   *
+   * @param {Element|null} item
+   * @returns {boolean}
+   */
+  function isMenuItemSelected(item) {
     if (!item) {
-      await sleep(300);
-      item = findItemByLabel(modeLabel);
+      return false;
     }
 
-    if (!item) {
-      throw new Error(`Mode not found in menu: ${modeLabel}`);
+    if (
+      item.getAttribute(
+        'aria-checked'
+      ) === 'true' ||
+      item.getAttribute(
+        'aria-selected'
+      ) === 'true' ||
+      item.getAttribute(
+        'data-checked'
+      ) === 'true'
+    ) {
+      return true;
     }
 
-    if (isItemSelected(item)) {
-      console.log('[AutoMode] Already selected:', modeLabel);
-      return 'already-selected';
-    }
+    const checkmark =
+      item.querySelector(
+        [
+          'svg[data-testid*="check"]',
+          '[data-icon-name*="Check"]',
+          '[aria-label="Selected"]',
+          '[aria-label="selected"]'
+        ].join(', ')
+      );
 
-    safeClick(item);
-    console.log('[AutoMode] Clicked mode:', modeLabel);
-    return 'clicked';
+    return isVisible(checkmark);
   }
 
-  async function runOnceForCurrentUrl() {
-    if (runInProgress) return;
-    if (!currentUrlMatches()) return;
-    if (lastProcessedUrl === location.href) return;
-
-    runInProgress = true;
-    try {
-      const mode = getMode();
-      await selectMode(mode);
-      lastProcessedUrl = location.href;
-    } catch (err) {
-      console.warn('[AutoMode] Failed:', err);
-    } finally {
-      runInProgress = false;
+  /**
+   * Closes any currently open menus.
+   */
+  function closeMenus() {
+    if (getOpenMenus().length === 0) {
+      return;
     }
+
+    const options = {
+      key: 'Escape',
+      code: 'Escape',
+      keyCode: 27,
+      which: 27,
+      bubbles: true,
+      cancelable: true,
+      composed: true
+    };
+
+    const target =
+      document.activeElement ||
+      document.body;
+
+    target.dispatchEvent(
+      new KeyboardEvent(
+        'keydown',
+        options
+      )
+    );
+
+    target.dispatchEvent(
+      new KeyboardEvent(
+        'keyup',
+        options
+      )
+    );
   }
 
-  function registerMenu() {
-    GM_registerMenuCommand(`Set target mode (current: ${getMode()})`, () => {
-      const next = prompt('Enter the exact menu label to click:', getMode());
-      if (next != null) {
-        setMode(next);
-        alert(`Saved target mode:\n${getMode()}`);
+  /*
+   * ================================================================
+   * MODEL SELECTION
+   * ================================================================
+   */
+
+  /**
+   * Opens the main model-selection menu only when model selection is
+   * necessary.
+   *
+   * @returns {Promise<Element>}
+   */
+  async function openSwitcherMenu() {
+    const switcher =
+      await waitForElement(
+        () => getSwitcherButton(),
+        ELEMENT_TIMEOUT_MS
+      );
+
+    /*
+     * Recheck immediately before clicking. Copilot may finish restoring
+     * the saved model between the first check and this function.
+     */
+    if (
+      isConfiguredModelAlreadyActive()
+    ) {
+      throw new Error(
+        'CONFIGURED_MODEL_ALREADY_ACTIVE'
+      );
+    }
+
+    /*
+     * Close another accidentally opened menu first.
+     */
+    if (getOpenMenus().length > 0) {
+      closeMenus();
+      await sleep(100);
+    }
+
+    const menuCountBeforeClick =
+      getOpenMenus().length;
+
+    if (!safeClick(switcher)) {
+      throw new Error(
+        'Could not click the model switcher'
+      );
+    }
+
+    return waitForElement(() => {
+      const menus = getOpenMenus();
+
+      if (
+        menus.length >
+        menuCountBeforeClick
+      ) {
+        return menus[
+          menus.length - 1
+        ];
       }
-    });
 
-    GM_registerMenuCommand(
-      `Toggle "click More first" (currently: ${getAlwaysClickMore() ? 'ON' : 'OFF'})`,
+      return null;
+    });
+  }
+
+  /**
+   * Opens a submenu and returns the newly opened menu.
+   *
+   * @param {Element} parentItem
+   * @param {Element} previousMenu
+   * @param {string} nextLabel
+   * @returns {Promise<Element>}
+   */
+  async function openSubmenu(
+    parentItem,
+    previousMenu,
+    nextLabel
+  ) {
+    const menusBeforeClick =
+      getOpenMenus();
+
+    if (!safeClick(parentItem)) {
+      throw new Error(
+        `Could not click submenu item: ${
+          getMenuItemText(parentItem)
+        }`
+      );
+    }
+
+    try {
+      return await waitForElement(
+        () => {
+          const menusAfterClick =
+            getOpenMenus();
+
+          /*
+           * Normal Fluent UI behaviour adds a second visible menu.
+           */
+          if (
+            menusAfterClick.length >
+            menusBeforeClick.length
+          ) {
+            return menusAfterClick[
+              menusAfterClick.length - 1
+            ];
+          }
+
+          /*
+           * Some versions can replace the current menu instead.
+           */
+          const newestMenu =
+            menusAfterClick[
+              menusAfterClick.length - 1
+            ];
+
+          if (
+            newestMenu &&
+            newestMenu !== previousMenu &&
+            findMenuItem(
+              newestMenu,
+              nextLabel
+            )
+          ) {
+            return newestMenu;
+          }
+
+          return null;
+        },
+        4000
+      );
+    } catch (firstError) {
+      /*
+       * Fluent UI supports opening submenus with ArrowRight. Use this
+       * only as a fallback when the pointer click does not open it.
+       */
+      if (
+        typeof parentItem.focus ===
+        'function'
+      ) {
+        parentItem.focus();
+      }
+
+      parentItem.dispatchEvent(
+        new KeyboardEvent(
+          'keydown',
+          {
+            key: 'ArrowRight',
+            code: 'ArrowRight',
+            keyCode: 39,
+            which: 39,
+            bubbles: true,
+            cancelable: true,
+            composed: true
+          }
+        )
+      );
+
+      return waitForElement(
+        () => {
+          const menus =
+            getOpenMenus();
+
+          const newestMenu =
+            menus[menus.length - 1];
+
+          if (
+            newestMenu &&
+            newestMenu !== previousMenu &&
+            findMenuItem(
+              newestMenu,
+              nextLabel
+            )
+          ) {
+            return newestMenu;
+          }
+
+          return null;
+        },
+        4000
+      );
+    }
+  }
+
+  /**
+   * Selects the configured model.
+   *
+   * @returns {Promise<string>}
+   */
+  async function selectConfiguredModel() {
+    const modelPath = getModelPath();
+
+    if (modelPath.length === 0) {
+      throw new Error(
+        'No model path is configured'
+      );
+    }
+
+    let currentMenu =
+      await openSwitcherMenu();
+
+    for (
+      let pathIndex = 0;
+      pathIndex < modelPath.length;
+      pathIndex += 1
+    ) {
+      const label =
+        modelPath[pathIndex];
+
+      const isFinalItem =
+        pathIndex ===
+        modelPath.length - 1;
+
+      console.log(
+        `[Save3Clicks] Looking for item ${
+          pathIndex + 1
+        }/${modelPath.length}:`,
+        label
+      );
+
+      const item =
+        await waitForElement(
+          () => findMenuItem(
+            currentMenu,
+            label
+          ),
+          6000
+        );
+
+      if (isFinalItem) {
+        if (
+          isMenuItemSelected(item)
+        ) {
+          closeMenus();
+
+          return 'already-selected';
+        }
+
+        if (!safeClick(item)) {
+          throw new Error(
+            `Could not click final model: ${label}`
+          );
+        }
+
+        await sleep(250);
+
+        return 'selected';
+      }
+
+      currentMenu =
+        await openSubmenu(
+          item,
+          currentMenu,
+          modelPath[pathIndex + 1]
+        );
+    }
+
+    throw new Error(
+      'The configured model path was not completed'
+    );
+  }
+
+  /**
+   * Runs one model-selection operation.
+   *
+   * @param {boolean} force
+   * @returns {Promise<string>}
+   */
+  async function runSelection(
+    force = false
+  ) {
+    if (selectionInProgress) {
+      return 'already-running';
+    }
+
+    if (!isCopilotChatPage()) {
+      return 'not-a-chat-page';
+    }
+
+    if (
+      !force &&
+      !isAutomaticSelectionEnabled()
+    ) {
+      return 'disabled';
+    }
+
+    selectionInProgress = true;
+
+    try {
+      /*
+       * Wait until Copilot has created the model switcher.
+       */
+      await waitForElement(
+        () => getSwitcherButton(),
+        ELEMENT_TIMEOUT_MS
+      );
+
+      /*
+       * Copilot can restore the conversation's previous model shortly
+       * after creating the switcher.
+       */
+      await sleep(150);
+
+      /*
+       * Do not open the menu if the configured model is already active.
+       *
+       * This recognizes both:
+       *
+       *   GPT 5.6 Think deeper
+       *
+       * and the abbreviated switcher label:
+       *
+       *   GPT 5.6 Think
+       */
+      if (
+        isConfiguredModelAlreadyActive()
+      ) {
+        lastSuccessfulUrl =
+          location.href;
+
+        console.log(
+          '[Save3Clicks] Configured model is already active:',
+          getSwitcherText()
+        );
+
+        return 'already-selected';
+      }
+
+      console.log(
+        '[Save3Clicks] Starting selection:',
+        getModelPath().join(' -> ')
+      );
+
+      const result =
+        await selectConfiguredModel();
+
+      lastSuccessfulUrl =
+        location.href;
+
+      console.log(
+        '[Save3Clicks] Selection finished:',
+        result
+      );
+
+      return result;
+    } catch (error) {
+      closeMenus();
+
+      /*
+       * This is an ordinary timing condition rather than a failure.
+       * Copilot restored the configured model immediately before the
+       * script attempted to open the menu.
+       */
+      if (
+        error instanceof Error &&
+        error.message ===
+          'CONFIGURED_MODEL_ALREADY_ACTIVE'
+      ) {
+        lastSuccessfulUrl =
+          location.href;
+
+        console.log(
+          '[Save3Clicks] Configured model became active before the menu was opened.'
+        );
+
+        return 'already-selected';
+      }
+
+      console.warn(
+        '[Save3Clicks] Selection failed:',
+        error
+      );
+
+      throw error;
+    } finally {
+      selectionInProgress = false;
+    }
+  }
+
+  /**
+   * Schedules a debounced automatic selection.
+   *
+   * Multiple requests occurring close together are combined into one
+   * actual attempt.
+   *
+   * @param {number} delay
+   */
+  function scheduleSelection(
+    delay = NAVIGATION_DELAY_MS
+  ) {
+    if (
+      !isAutomaticSelectionEnabled()
+    ) {
+      return;
+    }
+
+    clearTimeout(
+      pendingSelectionTimer
+    );
+
+    pendingSelectionTimer =
+      setTimeout(() => {
+        pendingSelectionTimer = null;
+
+        runSelection(false).catch(() => {
+          /*
+           * runSelection() already writes detailed errors to the
+           * console.
+           */
+        });
+      }, delay);
+  }
+
+  /*
+   * ================================================================
+   * COPILOT NAVIGATION DETECTION
+   * ================================================================
+   */
+
+  /**
+   * Installs a lightweight watcher for single-page navigation.
+   */
+  function installHistoryWatcher() {
+    const originalPushState =
+      history.pushState;
+
+    const originalReplaceState =
+      history.replaceState;
+
+    history.pushState = function (
+      ...argumentsList
+    ) {
+      const result =
+        originalPushState.apply(
+          this,
+          argumentsList
+        );
+
+      window.dispatchEvent(
+        new Event(
+          'save3clicks:navigation'
+        )
+      );
+
+      return result;
+    };
+
+    history.replaceState = function (
+      ...argumentsList
+    ) {
+      const result =
+        originalReplaceState.apply(
+          this,
+          argumentsList
+        );
+
+      window.dispatchEvent(
+        new Event(
+          'save3clicks:navigation'
+        )
+      );
+
+      return result;
+    };
+
+    window.addEventListener(
+      'popstate',
       () => {
-        setAlwaysClickMore(!getAlwaysClickMore());
-        alert(`click More first = ${getAlwaysClickMore() ? 'ON' : 'OFF'}`);
+        window.dispatchEvent(
+          new Event(
+            'save3clicks:navigation'
+          )
+        );
       }
     );
 
-    GM_registerMenuCommand('Set URL rules (one per line; substring or /regex/)', () => {
-      const current = getUrlRules().join('\n');
-      const next = prompt(
-        'Enter URL rules, one per line.\n\nExamples:\nhttps://copilot.microsoft.com/\n/copilot\\.microsoft\\.com\\/.*/',
-        current
+    window.addEventListener(
+      'save3clicks:navigation',
+      () => {
+        lastSuccessfulUrl = null;
+
+        scheduleSelection();
+
+        /*
+         * Copilot may replace the complete switcher subtree during
+         * internal navigation, so refresh the targeted observer.
+         */
+        setTimeout(() => {
+          installSwitcherObserver();
+        }, NAVIGATION_DELAY_MS);
+      }
+    );
+  }
+
+  /**
+   * Installs or refreshes the observer for the current model-switcher
+   * area.
+   */
+  async function installSwitcherObserver() {
+    let switcher;
+
+    try {
+      switcher =
+        await waitForElement(
+          () => getSwitcherButton(),
+          15000
+        );
+    } catch (error) {
+      console.warn(
+        '[Save3Clicks] Model switcher was not found during initialization.'
       );
-      if (next != null) {
-        setUrlRules(next);
-        alert(`Saved ${getUrlRules().length} URL rule(s).`);
-      }
-    });
 
-    GM_registerMenuCommand('Run now on this page', async () => {
-      try {
-        await selectMode(getMode());
-        alert(`Done: attempted to select "${getMode()}"`);
-      } catch (err) {
-        alert(`Failed: ${err.message}`);
+      return;
+    }
+
+    const observationRoot =
+      switcher.parentElement ||
+      switcher;
+
+    /*
+     * Keep the current observer if it is already attached to the
+     * correct, connected Copilot subtree.
+     */
+    if (
+      switcherObserver &&
+      observedSwitcherRoot ===
+        observationRoot &&
+      observationRoot.isConnected
+    ) {
+      return;
+    }
+
+    /*
+     * Disconnect an observer left on an obsolete Copilot subtree.
+     */
+    if (switcherObserver) {
+      switcherObserver.disconnect();
+    }
+
+    observedSwitcherRoot =
+      observationRoot;
+
+    switcherObserver =
+      new MutationObserver(() => {
+        /*
+         * Reselect only when Copilot visibly returns to Automatic mode.
+         */
+        if (isAutomaticModeShown()) {
+          lastSuccessfulUrl = null;
+          scheduleSelection(300);
+        }
+      });
+
+    switcherObserver.observe(
+      observationRoot,
+      {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: [
+          'aria-label',
+          'title',
+          'aria-expanded'
+        ]
       }
-    });
+    );
   }
 
-  function initUrlWatcher() {
-    let lastUrl = location.href;
+  /*
+   * ================================================================
+   * VIOLENTMONKEY MENU COMMANDS
+   * ================================================================
+   */
 
-    setInterval(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        lastProcessedUrl = null;
-        runOnceForCurrentUrl();
+  /**
+   * Registers the userscript menu commands.
+   */
+  function registerMenuCommands() {
+    GM_registerMenuCommand(
+      `Set model path: ${
+        getModelPath().join(' -> ')
+      }`,
+      () => {
+        /*
+         * A vertical bar or a line break can separate menu levels.
+         */
+        const currentPath =
+          getModelPath().join(' | ');
+
+        const enteredPath = prompt(
+          [
+            'Enter the model path.',
+            '',
+            'Separate menu levels with | or a line break.',
+            '',
+            'Example:',
+            'GPT | GPT 5.6 Think deeper'
+          ].join('\n'),
+          currentPath
+        );
+
+        if (enteredPath === null) {
+          return;
+        }
+
+        const newPath = enteredPath
+          .split(/\r?\n|\|/)
+          .map(value => value.trim())
+          .filter(Boolean);
+
+        setModelPath(newPath);
+        lastSuccessfulUrl = null;
+
+        alert(
+          `Saved model path:\n${
+            getModelPath().join(' -> ')
+          }`
+        );
       }
-    }, 500);
+    );
 
-    // runs it once but retries if fails
-    runOnceForCurrentUrl();
-    setTimeout(runOnceForCurrentUrl, 1500);
-    setTimeout(runOnceForCurrentUrl, 3500);
+    GM_registerMenuCommand(
+      `Toggle automatic selection: ${
+        isAutomaticSelectionEnabled()
+          ? 'ON'
+          : 'OFF'
+      }`,
+      () => {
+        const newValue =
+          !isAutomaticSelectionEnabled();
+
+        setAutomaticSelectionEnabled(
+          newValue
+        );
+
+        alert(
+          `Automatic selection is now ${
+            newValue ? 'ON' : 'OFF'
+          }.`
+        );
+
+        if (newValue) {
+          lastSuccessfulUrl = null;
+          scheduleSelection(100);
+        } else {
+          clearTimeout(
+            pendingSelectionTimer
+          );
+
+          pendingSelectionTimer = null;
+        }
+      }
+    );
+
+    GM_registerMenuCommand(
+      'Select configured model now',
+      async () => {
+        try {
+          const result =
+            await runSelection(true);
+
+          alert(
+            [
+              'Model-selection attempt completed.',
+              '',
+              `Result: ${result}`,
+              `Path: ${
+                getModelPath().join(
+                  ' -> '
+                )
+              }`
+            ].join('\n')
+          );
+        } catch (error) {
+          alert(
+            `Model selection failed:\n${
+              error.message
+            }`
+          );
+        }
+      }
+    );
+
+    GM_registerMenuCommand(
+      'Reset model path to default',
+      () => {
+        setModelPath(
+          DEFAULT_MODEL_PATH
+        );
+
+        lastSuccessfulUrl = null;
+
+        alert(
+          `Model path reset:\n${
+            DEFAULT_MODEL_PATH.join(
+              ' -> '
+            )
+          }`
+        );
+      }
+    );
+
+    GM_registerMenuCommand(
+      'Show current configuration',
+      () => {
+        alert(
+          [
+            'Save3Clicks configuration',
+            '',
+            `Automatic selection: ${
+              isAutomaticSelectionEnabled()
+                ? 'ON'
+                : 'OFF'
+            }`,
+            `Model path: ${
+              getModelPath().join(
+                ' -> '
+              )
+            }`,
+            `Current URL: ${
+              location.href
+            }`,
+            `Chat page: ${
+              isCopilotChatPage()
+                ? 'YES'
+                : 'NO'
+            }`,
+            `Switcher text: ${
+              getSwitcherText() ||
+              '(not found)'
+            }`,
+            `Configured model active: ${
+              isConfiguredModelAlreadyActive()
+                ? 'YES'
+                : 'NO'
+            }`,
+            `Last successfully handled URL: ${
+              lastSuccessfulUrl ||
+              '(none)'
+            }`
+          ].join('\n')
+        );
+      }
+    );
   }
 
-  registerMenu();
-  initUrlWatcher();
+  /*
+   * ================================================================
+   * INITIALIZATION
+   * ================================================================
+   */
+
+  /**
+   * Initializes Save3Clicks.
+   */
+  function initialize() {
+    console.log(
+      '[Save3Clicks] Initializing version 1.4.0'
+    );
+
+    console.log(
+      '[Save3Clicks] Configured model path:',
+      getModelPath().join(' -> ')
+    );
+
+    registerMenuCommands();
+    installHistoryWatcher();
+
+    /*
+     * Install the targeted switcher observer after Copilot creates the
+     * relevant interface.
+     */
+    installSwitcherObserver();
+
+    /*
+     * One initial attempt is sufficient because waitForElement() waits
+     * for a slow-loading switcher.
+     */
+    scheduleSelection(500);
+  }
+
+  initialize();
 })();

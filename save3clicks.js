@@ -2,7 +2,7 @@
 // @name         Save3Clicks for M365 Copilot
 // @namespace    anon.local.Save3Clicks
 // @version      1.2.0
-// @description  Automatically selects a preferred model in Microsoft 365 Copilot.
+// @description  Automatically selects a preferred model and focuses the prompt field in Microsoft 365 Copilot.
 // @match        https://m365.cloud.microsoft/*
 // @run-at       document-idle
 // @grant        GM_getValue
@@ -34,7 +34,8 @@
   ];
 
   /*
-   * Automatic selection runs only on Copilot Chat URLs.
+   * Automatic selection and prompt focusing run only on Copilot Chat
+   * URLs.
    */
   const CHAT_URL_PREFIX =
     'https://m365.cloud.microsoft/chat';
@@ -56,10 +57,16 @@
   const ELEMENT_TIMEOUT_MS = 10000;
 
   /*
+   * Maximum time to wait for the Copilot prompt field.
+   */
+  const PROMPT_TIMEOUT_MS = 15000;
+
+  /*
    * Internal state.
    */
   let selectionInProgress = false;
   let pendingSelectionTimer = null;
+  let pendingFocusTimer = null;
   let lastSuccessfulUrl = null;
   let switcherObserver = null;
   let observedSwitcherRoot = null;
@@ -242,6 +249,7 @@
 
     return new Promise((resolve, reject) => {
       let completed = false;
+      let timeoutTimer = null;
 
       /**
        * Stops the temporary observer and timeout.
@@ -252,7 +260,11 @@
         }
 
         completed = true;
-        clearTimeout(timeoutTimer);
+
+        if (timeoutTimer !== null) {
+          clearTimeout(timeoutTimer);
+        }
+
         observer.disconnect();
       }
 
@@ -287,12 +299,14 @@
             'aria-label',
             'title',
             'style',
-            'class'
+            'class',
+            'contenteditable',
+            'disabled'
           ]
         }
       );
 
-      const timeoutTimer = setTimeout(() => {
+      timeoutTimer = setTimeout(() => {
         cleanup();
 
         reject(
@@ -379,6 +393,379 @@
 
       return false;
     }
+  }
+
+  /*
+   * ================================================================
+   * PROMPT FIELD DETECTION AND AUTO-FOCUS
+   * ================================================================
+   */
+
+  /**
+   * Assigns a suitability score to a possible Copilot prompt field.
+   *
+   * A higher score means that the element is more likely to be the
+   * main chat composer rather than a search field or another textbox.
+   *
+   * @param {Element} element
+   * @returns {number}
+   */
+  function scorePromptCandidate(element) {
+    if (!isVisible(element)) {
+      return -Infinity;
+    }
+
+    if (
+      element.disabled ||
+      element.getAttribute('aria-disabled') === 'true' ||
+      element.getAttribute('contenteditable') === 'false'
+    ) {
+      return -Infinity;
+    }
+
+    const rectangle =
+      element.getBoundingClientRect();
+
+    const searchableText = normalizeText(
+      [
+        element.getAttribute('aria-label'),
+        element.getAttribute('placeholder'),
+        element.getAttribute('title'),
+        element.getAttribute('data-testid'),
+        element.getAttribute('id'),
+        element.getAttribute('class')
+      ]
+        .filter(Boolean)
+        .join(' ')
+    );
+
+    let score = 0;
+
+    /*
+     * The main prompt field is normally located in the lower part of
+     * the window.
+     */
+    const verticalPosition =
+      rectangle.top /
+      Math.max(window.innerHeight, 1);
+
+    score += verticalPosition * 100;
+
+    /*
+     * The main prompt is generally wider than search fields and other
+     * auxiliary controls.
+     */
+    score += Math.min(
+      rectangle.width / 10,
+      100
+    );
+
+    if (
+      element.tagName === 'TEXTAREA'
+    ) {
+      score += 80;
+    }
+
+    if (
+      element.getAttribute('role') ===
+      'textbox'
+    ) {
+      score += 50;
+    }
+
+    if (element.isContentEditable) {
+      score += 50;
+    }
+
+    /*
+     * Positive indicators commonly used for the Copilot composer.
+     */
+    const positiveTerms = [
+      'prompt',
+      'message',
+      'chat',
+      'copilot',
+      'ask',
+      'type',
+      'draft',
+      'compose',
+      'input'
+    ];
+
+    for (const term of positiveTerms) {
+      if (searchableText.includes(term)) {
+        score += 30;
+      }
+    }
+
+    /*
+     * Penalize controls that are likely to be site search fields.
+     */
+    const negativeTerms = [
+      'search',
+      'find',
+      'filter'
+    ];
+
+    for (const term of negativeTerms) {
+      if (searchableText.includes(term)) {
+        score -= 150;
+      }
+    }
+
+    /*
+     * Prefer elements inside a form or a region containing a send
+     * button.
+     */
+    const surroundingContainer =
+      element.closest(
+        'form, [role="form"], [class*="chat"], [class*="input"], [class*="composer"]'
+      );
+
+    if (surroundingContainer) {
+      score += 30;
+
+      const sendControl =
+        surroundingContainer.querySelector(
+          [
+            'button[aria-label*="Send" i]',
+            'button[title*="Send" i]',
+            'button[data-testid*="send" i]'
+          ].join(', ')
+        );
+
+      if (sendControl) {
+        score += 100;
+      }
+    }
+
+    return score;
+  }
+
+  /**
+   * Finds the most likely Copilot prompt field.
+   *
+   * @returns {Element|null}
+   */
+  function getPromptField() {
+    if (!isCopilotChatPage()) {
+      return null;
+    }
+
+    const selectors = [
+      'textarea:not([disabled])',
+      '[contenteditable="true"][role="textbox"]',
+      '[role="textbox"][contenteditable="true"]',
+      '[contenteditable="true"]',
+      '[role="textbox"]:not([aria-disabled="true"])'
+    ];
+
+    const candidates = [
+      ...new Set(
+        document.querySelectorAll(
+          selectors.join(', ')
+        )
+      )
+    ];
+
+    const rankedCandidates = candidates
+      .map(element => ({
+        element,
+        score:
+          scorePromptCandidate(element)
+      }))
+      .filter(candidate => {
+        return Number.isFinite(
+          candidate.score
+        );
+      })
+      .sort((first, second) => {
+        return second.score - first.score;
+      });
+
+    return rankedCandidates.length > 0
+      ? rankedCandidates[0].element
+      : null;
+  }
+
+  /**
+   * Places the text caret at the end of a contenteditable prompt.
+   *
+   * @param {Element} element
+   */
+  function placeCaretAtEnd(element) {
+    if (!element.isContentEditable) {
+      return;
+    }
+
+    const selection =
+      window.getSelection();
+
+    if (!selection) {
+      return;
+    }
+
+    const range =
+      document.createRange();
+
+    range.selectNodeContents(element);
+    range.collapse(false);
+
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  /**
+   * Clicks and focuses the Copilot prompt field.
+   *
+   * @param {boolean} force
+   * @returns {Promise<boolean>}
+   */
+  async function focusPromptField(
+    force = false
+  ) {
+    if (!isCopilotChatPage()) {
+      return false;
+    }
+
+    let promptField;
+
+    try {
+      promptField =
+        await waitForElement(
+          () => getPromptField(),
+          PROMPT_TIMEOUT_MS
+        );
+    } catch (error) {
+      console.warn(
+        '[Save3Clicks] Prompt field was not found:',
+        error
+      );
+
+      return false;
+    }
+
+    /*
+     * Do not take focus away if the user has already focused another
+     * editable field. The force option is used by the manual menu
+     * command.
+     */
+    const activeElement =
+      document.activeElement;
+
+    const userIsEditing =
+      activeElement &&
+      activeElement !== document.body &&
+      activeElement !== document.documentElement &&
+      (
+        activeElement.tagName === 'INPUT' ||
+        activeElement.tagName === 'TEXTAREA' ||
+        activeElement.isContentEditable ||
+        activeElement.getAttribute('role') ===
+          'textbox'
+      );
+
+    if (
+      !force &&
+      userIsEditing &&
+      activeElement !== promptField
+    ) {
+      console.log(
+        '[Save3Clicks] Prompt auto-focus skipped because another editable field is active.'
+      );
+
+      return false;
+    }
+
+    try {
+      promptField.scrollIntoView({
+        block: 'nearest',
+        inline: 'nearest'
+      });
+
+      /*
+       * A normal click helps activate Fluent UI or Lexical-based input
+       * fields before focus() is called.
+       */
+      promptField.click();
+
+      if (
+        typeof promptField.focus ===
+        'function'
+      ) {
+        promptField.focus({
+          preventScroll: true
+        });
+      }
+
+      placeCaretAtEnd(promptField);
+
+      /*
+       * Reapply focus on the next animation frame in case the click
+       * caused Copilot to re-render the composer.
+       */
+      requestAnimationFrame(() => {
+        const currentPrompt =
+          getPromptField() ||
+          promptField;
+
+        if (
+          currentPrompt &&
+          typeof currentPrompt.focus ===
+            'function'
+        ) {
+          currentPrompt.focus({
+            preventScroll: true
+          });
+
+          placeCaretAtEnd(
+            currentPrompt
+          );
+        }
+      });
+
+      console.log(
+        '[Save3Clicks] Prompt field focused.'
+      );
+
+      return true;
+    } catch (error) {
+      console.warn(
+        '[Save3Clicks] Prompt focus failed:',
+        error
+      );
+
+      return false;
+    }
+  }
+
+  /**
+   * Schedules a debounced prompt-focus attempt.
+   *
+   * @param {number} delay
+   * @param {boolean} force
+   */
+  function schedulePromptFocus(
+    delay = 100,
+    force = false
+  ) {
+    clearTimeout(
+      pendingFocusTimer
+    );
+
+    pendingFocusTimer =
+      setTimeout(() => {
+        pendingFocusTimer = null;
+
+        focusPromptField(force).catch(
+          error => {
+            console.warn(
+              '[Save3Clicks] Scheduled prompt focus failed:',
+              error
+            );
+          }
+        );
+      }, delay);
   }
 
   /*
@@ -476,16 +863,6 @@
    * Returns whether the closed switcher represents the configured
    * final model.
    *
-   * Copilot may abbreviate:
-   *
-   *   GPT 5.6 Think deeper
-   *
-   * as:
-   *
-   *   GPT 5.6 Think
-   *
-   * The model version and mode are therefore compared independently.
-   *
    * @returns {boolean}
    */
   function isConfiguredModelAlreadyActive() {
@@ -500,24 +877,12 @@
       return false;
     }
 
-    /*
-     * A complete target label in the switcher is an unambiguous match.
-     */
     if (
       switcherText.includes(targetText)
     ) {
       return true;
     }
 
-    /*
-     * Extract the GPT version from the target and switcher.
-     *
-     * Accepted forms include:
-     *
-     *   GPT 5.6
-     *   GPT-5.6
-     *   GPT5.6
-     */
     const versionExpression =
       /\bgpt\s*-?\s*(\d+(?:\.\d+)*)\b/;
 
@@ -539,10 +904,6 @@
       return false;
     }
 
-    /*
-     * Distinguish a reasoning model from a quick-response model using
-     * the same GPT version.
-     */
     const targetIsThinkMode =
       targetText.includes('think') ||
       targetText.includes('deeper');
@@ -641,9 +1002,6 @@
 
   /**
    * Finds a menu item by its visible label.
-   *
-   * Exact matching is preferred so that "GPT" does not accidentally
-   * match "GPT 5.6 Think deeper".
    *
    * @param {Element|null} menu
    * @param {string} label
@@ -768,10 +1126,6 @@
         ELEMENT_TIMEOUT_MS
       );
 
-    /*
-     * Recheck immediately before clicking. Copilot may finish restoring
-     * the saved model between the first check and this function.
-     */
     if (
       isConfiguredModelAlreadyActive()
     ) {
@@ -780,9 +1134,6 @@
       );
     }
 
-    /*
-     * Close another accidentally opened menu first.
-     */
     if (getOpenMenus().length > 0) {
       closeMenus();
       await sleep(100);
@@ -843,9 +1194,6 @@
           const menusAfterClick =
             getOpenMenus();
 
-          /*
-           * Normal Fluent UI behaviour adds a second visible menu.
-           */
           if (
             menusAfterClick.length >
             menusBeforeClick.length
@@ -855,9 +1203,6 @@
             ];
           }
 
-          /*
-           * Some versions can replace the current menu instead.
-           */
           const newestMenu =
             menusAfterClick[
               menusAfterClick.length - 1
@@ -879,10 +1224,6 @@
         4000
       );
     } catch (firstError) {
-      /*
-       * Fluent UI supports opening submenus with ArrowRight. Use this
-       * only as a fallback when the pointer click does not open it.
-       */
       if (
         typeof parentItem.focus ===
         'function'
@@ -1012,6 +1353,9 @@
   /**
    * Runs one model-selection operation.
    *
+   * The prompt field is focused after every successfully completed or
+   * unnecessary model-selection attempt.
+   *
    * @param {boolean} force
    * @returns {Promise<string>}
    */
@@ -1030,37 +1374,25 @@
       !force &&
       !isAutomaticSelectionEnabled()
     ) {
+      /*
+       * Auto-focus remains available even if automatic model selection
+       * is disabled.
+       */
+      schedulePromptFocus(100);
+
       return 'disabled';
     }
 
     selectionInProgress = true;
 
     try {
-      /*
-       * Wait until Copilot has created the model switcher.
-       */
       await waitForElement(
         () => getSwitcherButton(),
         ELEMENT_TIMEOUT_MS
       );
 
-      /*
-       * Copilot can restore the conversation's previous model shortly
-       * after creating the switcher.
-       */
       await sleep(150);
 
-      /*
-       * Do not open the menu if the configured model is already active.
-       *
-       * This recognizes both:
-       *
-       *   GPT 5.6 Think deeper
-       *
-       * and the abbreviated switcher label:
-       *
-       *   GPT 5.6 Think
-       */
       if (
         isConfiguredModelAlreadyActive()
       ) {
@@ -1071,6 +1403,12 @@
           '[Save3Clicks] Configured model is already active:',
           getSwitcherText()
         );
+
+        /*
+         * The model selector was not opened, so the prompt can be
+         * focused immediately.
+         */
+        schedulePromptFocus(50);
 
         return 'already-selected';
       }
@@ -1091,15 +1429,16 @@
         result
       );
 
+      /*
+       * Give Copilot a short moment to close the model menu and finish
+       * any composer re-render before focusing the prompt.
+       */
+      schedulePromptFocus(200);
+
       return result;
     } catch (error) {
       closeMenus();
 
-      /*
-       * This is an ordinary timing condition rather than a failure.
-       * Copilot restored the configured model immediately before the
-       * script attempted to open the menu.
-       */
       if (
         error instanceof Error &&
         error.message ===
@@ -1112,6 +1451,8 @@
           '[Save3Clicks] Configured model became active before the menu was opened.'
         );
 
+        schedulePromptFocus(100);
+
         return 'already-selected';
       }
 
@@ -1119,6 +1460,12 @@
         '[Save3Clicks] Selection failed:',
         error
       );
+
+      /*
+       * Even if model selection fails, try to leave the prompt ready
+       * for manual use.
+       */
+      schedulePromptFocus(200);
 
       throw error;
     } finally {
@@ -1129,9 +1476,6 @@
   /**
    * Schedules a debounced automatic selection.
    *
-   * Multiple requests occurring close together are combined into one
-   * actual attempt.
-   *
    * @param {number} delay
    */
   function scheduleSelection(
@@ -1140,6 +1484,12 @@
     if (
       !isAutomaticSelectionEnabled()
     ) {
+      /*
+       * Model selection is disabled, but prompt auto-focus should still
+       * work.
+       */
+      schedulePromptFocus(delay);
+
       return;
     }
 
@@ -1230,10 +1580,6 @@
 
         scheduleSelection();
 
-        /*
-         * Copilot may replace the complete switcher subtree during
-         * internal navigation, so refresh the targeted observer.
-         */
         setTimeout(() => {
           installSwitcherObserver();
         }, NAVIGATION_DELAY_MS);
@@ -1266,10 +1612,6 @@
       switcher.parentElement ||
       switcher;
 
-    /*
-     * Keep the current observer if it is already attached to the
-     * correct, connected Copilot subtree.
-     */
     if (
       switcherObserver &&
       observedSwitcherRoot ===
@@ -1279,9 +1621,6 @@
       return;
     }
 
-    /*
-     * Disconnect an observer left on an obsolete Copilot subtree.
-     */
     if (switcherObserver) {
       switcherObserver.disconnect();
     }
@@ -1291,9 +1630,6 @@
 
     switcherObserver =
       new MutationObserver(() => {
-        /*
-         * Reselect only when Copilot visibly returns to Automatic mode.
-         */
         if (isAutomaticModeShown()) {
           lastSuccessfulUrl = null;
           scheduleSelection(300);
@@ -1331,9 +1667,6 @@
         getModelPath().join(' -> ')
       }`,
       () => {
-        /*
-         * A vertical bar or a line break can separate menu levels.
-         */
         const currentPath =
           getModelPath().join(' | ');
 
@@ -1398,6 +1731,11 @@
           );
 
           pendingSelectionTimer = null;
+
+          /*
+           * Disabling model selection does not disable prompt focus.
+           */
+          schedulePromptFocus(100);
         }
       }
     );
@@ -1432,6 +1770,20 @@
     );
 
     GM_registerMenuCommand(
+      'Focus prompt field now',
+      async () => {
+        const focused =
+          await focusPromptField(true);
+
+        if (!focused) {
+          alert(
+            'The Copilot prompt field could not be found or focused.'
+          );
+        }
+      }
+    );
+
+    GM_registerMenuCommand(
       'Reset model path to default',
       () => {
         setModelPath(
@@ -1453,15 +1805,20 @@
     GM_registerMenuCommand(
       'Show current configuration',
       () => {
+        const promptField =
+          getPromptField();
+
         alert(
           [
             'Save3Clicks configuration',
             '',
+            'Version: 1.5.0',
             `Automatic selection: ${
               isAutomaticSelectionEnabled()
                 ? 'ON'
                 : 'OFF'
             }`,
+            'Prompt auto-focus: ON',
             `Model path: ${
               getModelPath().join(
                 ' -> '
@@ -1481,6 +1838,18 @@
             }`,
             `Configured model active: ${
               isConfiguredModelAlreadyActive()
+                ? 'YES'
+                : 'NO'
+            }`,
+            `Prompt field found: ${
+              promptField
+                ? 'YES'
+                : 'NO'
+            }`,
+            `Prompt field focused: ${
+              promptField &&
+              document.activeElement ===
+                promptField
                 ? 'YES'
                 : 'NO'
             }`,
@@ -1505,7 +1874,7 @@
    */
   function initialize() {
     console.log(
-      '[Save3Clicks] Initializing version 1.4.0'
+      '[Save3Clicks] Initializing version 1.5.0'
     );
 
     console.log(
@@ -1523,10 +1892,18 @@
     installSwitcherObserver();
 
     /*
-     * One initial attempt is sufficient because waitForElement() waits
-     * for a slow-loading switcher.
+     * Select the configured model. runSelection() focuses the prompt
+     * afterward.
      */
     scheduleSelection(500);
+
+    /*
+     * This fallback covers situations where the model switcher cannot
+     * be detected or automatic model selection is disabled. The
+     * debouncing mechanism means it does not conflict with the focus
+     * attempt performed after model selection.
+     */
+    schedulePromptFocus(2000);
   }
 
   initialize();
